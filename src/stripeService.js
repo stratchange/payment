@@ -47,15 +47,19 @@ function toIsoFromEpochSeconds(epochOrNull) {
   return new Date(epochOrNull * 1000).toISOString();
 }
 
-async function syncSubscriptionToSpring(subscription) {
-  // userId is stored in subscription.metadata.userId
-  const userIdStr = subscription.metadata?.userId;
+async function syncSubscriptionToSpring(subscription, userIdOverride) {
+  // userId is expected in subscription.metadata.userId,
+  // but we also accept a fallback override coming from checkout.session metadata.
+  const userIdStr = userIdOverride ?? subscription.metadata?.userId;
   if (!userIdStr) {
-    console.warn('No userId in subscription metadata, skipping sync');
+    console.warn('No userId found (subscription.metadata.userId missing + no override), skipping sync', {
+      subscriptionId: subscription?.id,
+    });
     return;
   }
-  const userId = Number(userIdStr);
-  if (!userId) return;
+  // userId can be either numeric (legacy) or MongoDB ObjectId (current shippizy-back)
+  const userId = String(userIdStr);
+  if (!userId || userId === '0') return;
 
   const items = subscription.items?.data || [];
   const firstItem = items[0];
@@ -80,7 +84,18 @@ async function syncSubscriptionToSpring(subscription) {
     headers['X-Internal-Api-Key'] = SPRING_SYNC_API_KEY;
   }
 
-  await axios.post(SPRING_SYNC_URL, payload, { headers });
+  try {
+    await axios.post(SPRING_SYNC_URL, payload, { headers });
+  } catch (err) {
+    // Make debugging easier: Spring might return 4xx/5xx with useful details.
+    console.error('Spring sync failed', {
+      message: err?.message,
+      responseStatus: err?.response?.status,
+      responseData: err?.response?.data,
+      payload,
+    });
+    throw err;
+  }
 }
 
 
@@ -119,6 +134,46 @@ async function createCheckoutSession({ userId, email, plan }) {
   return session.url;
 }
 
+// called by Spring -> Node: get an embedded checkout client_secret (no hosted Stripe redirect page)
+async function createEmbeddedCheckoutSession({ userId, email, plan }) {
+  const priceId = resolvePriceId(plan);
+
+  // Create a customer per email (simplification). Stripe will store subscription state on this customer.
+  const customer = await stripe.customers.create({
+    email,
+    metadata: { userId: String(userId) }
+  });
+
+  const session = await stripe.checkout.sessions.create({
+    mode: "subscription",
+    customer: customer.id,
+    ui_mode: "embedded",
+
+    // Embedded checkout uses `return_url` (not success_url/cancel_url).
+    // The client will redirect back to our app and we decide success/failed.
+    return_url: process.env.STRIPE_RETURN_URL || process.env.STRIPE_SUCCESS_URL,
+
+    client_reference_id: String(userId),
+    metadata: {
+      userId: String(userId)
+    },
+    subscription_data: {
+      metadata: {
+        userId: String(userId)
+      }
+    },
+    line_items: [
+      {
+        price: priceId,
+        quantity: 1
+      }
+    ]
+  });
+
+  // Embedded checkout sessions return a client_secret used by stripe-js to render the UI.
+  return session.client_secret;
+}
+
 // called by Spring -> Node to get a billing-portal URL
 async function createPortalSession({ customerId }) {
   const portalSession = await stripe.billingPortal.sessions.create({
@@ -130,12 +185,13 @@ async function createPortalSession({ customerId }) {
 }
 
 // called from webhook handler when we have a Subscription object
-async function handleSubscriptionChange(subscription) {
-  await syncSubscriptionToSpring(subscription);
+async function handleSubscriptionChange(subscription, userIdOverride) {
+  await syncSubscriptionToSpring(subscription, userIdOverride);
 }
 
 module.exports = {
   createCheckoutSession,
+  createEmbeddedCheckoutSession,
   createPortalSession,
   handleSubscriptionChange
 };

@@ -4,6 +4,7 @@ const stripeLib = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const {
   createCheckoutSession,
+  createEmbeddedCheckoutSession,
   createPortalSession,
   handleSubscriptionChange
 } = require('./stripeService');
@@ -25,6 +26,24 @@ router.post('/checkout-session', bodyParser.json(), async (req, res) => {
   } catch (err) {
     console.error('Error creating checkout session', err);
     res.status(500).json({ error: 'Failed to create checkout session' });
+  }
+});
+
+// 1.5) Spring -> Node: create embedded checkout client_secret (no hosted Stripe redirect page)
+// Body expected from Spring:
+// { "userId": 123, "email": "t@x.com", "plan": "MONTHLY" | "YEARLY" }
+router.post('/embedded-checkout-session', bodyParser.json(), async (req, res) => {
+  try {
+    const { userId, email, plan } = req.body;
+    if (!userId || !email || !plan) {
+      return res.status(400).json({ error: 'userId, email and plan are required' });
+    }
+
+    const clientSecret = await createEmbeddedCheckoutSession({ userId, email, plan });
+    res.json({ clientSecret });
+  } catch (err) {
+    console.error('Error creating embedded checkout session', err);
+    res.status(500).json({ error: 'Failed to create embedded checkout session' });
   }
 });
 
@@ -77,7 +96,8 @@ router.post(
             const subscription = await stripeLib.subscriptions.retrieve(
               session.subscription
             );
-            await handleSubscriptionChange(subscription);
+            const userIdFromCheckout = session.metadata?.userId;
+            await handleSubscriptionChange(subscription, userIdFromCheckout);
           }
           break;
         }
@@ -86,7 +106,7 @@ router.post(
         case 'customer.subscription.updated':
         case 'customer.subscription.deleted': {
           const subscription = event.data.object;
-          await handleSubscriptionChange(subscription);
+          await handleSubscriptionChange(subscription, subscription.metadata?.userId);
           break;
         }
 
@@ -101,5 +121,32 @@ router.post(
     }
   }
 );
+
+// Stripe -> Node: frontend can ask if the embedded checkout session succeeded.
+// Query expected: ?session_id=cs_test_...
+router.get('/embedded-checkout-session-status', async (req, res) => {
+  try {
+    const sessionId = req.query.session_id;
+    if (!sessionId || typeof sessionId !== 'string') {
+      return res.status(400).json({ error: 'session_id is required' });
+    }
+
+    const session = await stripeLib.checkout.sessions.retrieve(sessionId);
+
+    // For subscription checkout, "complete" corresponds to success.
+    const status = session.status;
+    const paymentStatus = session.payment_status || null;
+
+    res.json({
+      status,
+      paymentStatus,
+      customerId: session.customer || null,
+      subscriptionId: session.subscription || null,
+    });
+  } catch (err) {
+    console.error('Error retrieving embedded checkout session status', err);
+    res.status(500).json({ error: 'Failed to retrieve session status' });
+  }
+});
 
 module.exports = router;
