@@ -11,6 +11,13 @@ const {
 
 const router = express.Router();
 
+function requireInternalKey(req, res) {
+  const expected = process.env.SPRING_SYNC_API_KEY;
+  if (!expected) return true;
+  const got = req.headers['x-internal-api-key'];
+  return got === expected;
+}
+
 // 1) Spring -> Node: create checkout session
 // Body expected from Spring:
 // { "userId": 123, "email": "t@x.com", "plan": "MONTHLY" | "YEARLY" }
@@ -146,6 +153,43 @@ router.get('/embedded-checkout-session-status', async (req, res) => {
   } catch (err) {
     console.error('Error retrieving embedded checkout session status', err);
     res.status(500).json({ error: 'Failed to retrieve session status' });
+  }
+});
+
+// Internal: backend fetches invoices for a Stripe customer
+router.get('/invoices', async (req, res) => {
+  try {
+    if (!requireInternalKey(req, res)) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    const customerId = req.query.customerId;
+    if (!customerId || typeof customerId !== 'string') {
+      return res.status(400).json({ error: 'customerId is required' });
+    }
+
+    const invoices = await stripeLib.invoices.list({
+      customer: customerId,
+      limit: 20,
+    });
+
+    res.json({
+      invoices: (invoices.data || []).map((inv) => ({
+        id: inv.id,
+        status: inv.status,
+        amountPaid: inv.amount_paid,
+        amountDue: inv.amount_due,
+        currency: inv.currency,
+        created: inv.created,
+        hostedInvoiceUrl: inv.hosted_invoice_url,
+        invoicePdf: inv.invoice_pdf,
+        number: inv.number,
+        periodStart: inv.period_start,
+        periodEnd: inv.period_end,
+      })),
+    });
+  } catch (err) {
+    console.error('Error listing invoices', err);
+    res.status(500).json({ error: 'Failed to list invoices' });
   }
 });
 

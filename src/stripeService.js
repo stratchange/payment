@@ -64,7 +64,14 @@ async function syncSubscriptionToSpring(subscription, userIdOverride) {
   const items = subscription.items?.data || [];
   const firstItem = items[0];
   const priceId = firstItem?.price?.id || null;
-  const plan = mapPlanByPriceId(priceId);
+  // Prefer interval-based detection (more robust than priceId equality across envs).
+  const interval = firstItem?.price?.recurring?.interval || null; // "month" | "year" | ...
+  const plan =
+    interval === 'year'
+      ? 'YEARLY'
+      : interval === 'month'
+        ? 'MONTHLY'
+        : mapPlanByPriceId(priceId);
   const status = mapStatus(subscription.status);
   const currentPeriodEndIso = toIsoFromEpochSeconds(subscription.current_period_end);
 
