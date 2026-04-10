@@ -193,6 +193,12 @@ async function createPortalSession({ customerId }) {
 
 // called from webhook handler when we have a Subscription object
 async function handleSubscriptionChange(subscription, userIdOverride) {
+  const { persistSubscriptionFromStripe } = require('./subscriptionPersistence');
+  try {
+    await persistSubscriptionFromStripe(subscription, userIdOverride);
+  } catch (err) {
+    console.error('[billing-service] persistSubscriptionFromStripe failed:', err?.message || err);
+  }
   await syncSubscriptionToSpring(subscription, userIdOverride);
 }
 
@@ -200,5 +206,6 @@ module.exports = {
   createCheckoutSession,
   createEmbeddedCheckoutSession,
   createPortalSession,
-  handleSubscriptionChange
+  handleSubscriptionChange,
+  syncSubscriptionToSpring,
 };

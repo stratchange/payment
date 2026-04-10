@@ -120,13 +120,43 @@ Uses `STRIPE_WEBHOOK_SECRET` and raw body:
 
 On relevant events, it:
 1. Retrieves the Stripe subscription (when applicable)
-2. Calls `syncSubscriptionToSpring(...)`
+2. **Upserts** subscription and customer into the **billing MongoDB cluster** (`BILLING_MONGODB_URI`), when configured
+3. Calls `syncSubscriptionToSpring(...)` so `shippizy-back` can stay in sync until you read only from this service
+
+Webhook events are processed **at-most-once** per Stripe `event.id` when the billing DB is enabled (dedupe collection).
 
 **Response**
 Always returns:
 ```json
 { "received": true }
 ```
+
+---
+
+### `GET /billing/internal/subscription?userId=...` (internal)
+**Purpose**  
+Read the latest **Pro** subscription snapshot from the billing database (not from Shippizy MongoDB).
+
+**Auth**  
+Same as `/billing/invoices`: if `SPRING_SYNC_API_KEY` is set, require header `X-Internal-Api-Key`.
+
+**Response `200`**
+```json
+{
+  "customer": { "userId": "...", "stripeCustomerId": "cus_...", "email": null },
+  "subscription": {
+    "stripeSubscriptionId": "sub_...",
+    "plan": "MONTHLY",
+    "stripeStatus": "active",
+    "status": "ACTIVE",
+    "hasProAccess": true,
+    "currentPeriodEnd": "2026-05-08T12:00:00.000Z",
+    "cancelAtPeriodEnd": false
+  }
+}
+```
+
+**Response `404`** — no billing row for this user yet.
 
 ---
 
@@ -208,6 +238,16 @@ If the backend sync fails, the service logs detailed info:
 
 ---
 
+## Billing database (separate MongoDB cluster)
+
+- `BILLING_MONGODB_URI` — connection string to a **dedicated** MongoDB database (e.g. second Atlas cluster).
+- Collections: `billingcustomers`, `billingsubscriptions`, `webhookevents` (Mongoose defaults).
+- On each successful connect, the service runs `syncIndexes()` so **collections and indexes are created automatically** (no manual migration script for an empty database).
+- If unset, the service still runs and still calls `SPRING_SYNC_URL` after webhooks; only local persistence is skipped.
+- If set, startup **fails** if the connection cannot be opened (so you don’t run in production without the billing DB accidentally).
+
+---
+
 ## Environment variables (`stripe/.env`)
 
 **Do not commit secrets.**
@@ -232,6 +272,11 @@ Hosted checkout fallback (optional):
 
 Billing portal return:
 - `STRIPE_PORTAL_RETURN_URL`
+
+Billing database:
+- `BILLING_MONGODB_URI`
+  - Example (local): `mongodb://127.0.0.1:27017/shippizy-billing`
+  - Example (Atlas): `mongodb+srv://billing:...@cluster2.../billing?...`
 
 Backend sync target:
 - `SPRING_SYNC_URL`

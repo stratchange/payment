@@ -8,8 +8,14 @@ const {
   createPortalSession,
   handleSubscriptionChange
 } = require('./stripeService');
+const { isBillingDbConfigured } = require('./db');
+const WebhookEvent = require('./models/WebhookEvent');
+const { getSubscriptionSnapshotForUser } = require('./subscriptionPersistence');
+const transportRoutes = require('./transportRoutes');
 
 const router = express.Router();
+
+router.use(transportRoutes);
 
 function requireInternalKey(req, res) {
   const expected = process.env.SPRING_SYNC_API_KEY;
@@ -94,6 +100,13 @@ router.post(
     }
 
     try {
+      if (isBillingDbConfigured()) {
+        const existing = await WebhookEvent.findOne({ stripeEventId: event.id }).lean();
+        if (existing) {
+          return res.json({ received: true, duplicate: true });
+        }
+      }
+
       console.log('Received webhook event:', event.type);
 
       switch (event.type) {
@@ -119,6 +132,16 @@ router.post(
 
         default:
         // ignore other events
+      }
+
+      if (isBillingDbConfigured()) {
+        try {
+          await WebhookEvent.create({ stripeEventId: event.id, type: event.type });
+        } catch (dupErr) {
+          if (!dupErr || dupErr.code !== 11000) {
+            throw dupErr;
+          }
+        }
       }
 
       res.json({ received: true });
@@ -190,6 +213,32 @@ router.get('/invoices', async (req, res) => {
   } catch (err) {
     console.error('Error listing invoices', err);
     res.status(500).json({ error: 'Failed to list invoices' });
+  }
+});
+
+// Internal: read subscription snapshot from billing MongoDB (separate cluster)
+router.get('/internal/subscription', async (req, res) => {
+  try {
+    if (!requireInternalKey(req, res)) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    if (!isBillingDbConfigured()) {
+      return res.status(503).json({ error: 'Billing database not configured' });
+    }
+    const userId = req.query.userId;
+    if (!userId || typeof userId !== 'string') {
+      return res.status(400).json({ error: 'userId is required' });
+    }
+
+    const snapshot = await getSubscriptionSnapshotForUser(userId);
+    if (!snapshot) {
+      return res.status(404).json({ error: 'No billing record for user' });
+    }
+
+    return res.json(snapshot);
+  } catch (err) {
+    console.error('Error reading internal subscription', err);
+    res.status(500).json({ error: 'Failed to read subscription' });
   }
 });
 

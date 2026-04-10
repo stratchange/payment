@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const { connectBillingDb, isBillingDbConfigured } = require('./db');
 const billingRoutes = require('./stripeRoutes');
 
 const app = express();
@@ -17,6 +18,16 @@ app.get('/health', (_req, res) => {
 // All Stripe / billing endpoints under /billing
 app.use('/billing', billingRoutes);
 
-app.listen(port, () => {
-  console.log(`Billing service listening on port ${port}`);
-});
+(async function start() {
+  try {
+    await connectBillingDb();
+  } catch (err) {
+    if (isBillingDbConfigured()) {
+      console.error('[billing-service] BILLING_MONGODB_URI is set but connection failed:', err?.message || err);
+      process.exit(1);
+    }
+  }
+  app.listen(port, () => {
+    console.log(`Billing service listening on port ${port}`);
+  });
+})();
