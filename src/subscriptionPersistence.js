@@ -16,8 +16,16 @@ function mapPlanByPriceId(priceId) {
 function resolvePlanFromSubscription(subscription) {
   const items = subscription.items?.data || [];
   const firstItem = items[0];
-  const priceId = firstItem?.price?.id || null;
-  const interval = firstItem?.price?.recurring?.interval || null;
+  const priceRaw = firstItem?.price;
+  // Stripe may return price as an expanded object or as a bare price id string.
+  const priceId =
+    typeof priceRaw === 'string'
+      ? priceRaw
+      : priceRaw && typeof priceRaw === 'object'
+        ? priceRaw.id || null
+        : null;
+  const interval =
+    priceRaw && typeof priceRaw === 'object' ? priceRaw.recurring?.interval || null : null;
   if (interval === 'year') return 'YEARLY';
   if (interval === 'month') return 'MONTHLY';
   return mapPlanByPriceId(priceId);
@@ -76,8 +84,11 @@ async function resolveUserId(subscription, userIdOverride) {
 
 /**
  * Upsert subscription + customer into the billing MongoDB cluster.
+ * @param {object} subscription Stripe subscription object
+ * @param {string} [userIdOverride]
+ * @param {{ planOverride?: 'MONTHLY'|'YEARLY' }} [opts]
  */
-async function persistSubscriptionFromStripe(subscription, userIdOverride) {
+async function persistSubscriptionFromStripe(subscription, userIdOverride, opts = {}) {
   if (!isBillingDbConfigured()) {
     return { skipped: true, reason: 'no_billing_db' };
   }
@@ -101,8 +112,29 @@ async function persistSubscriptionFromStripe(subscription, userIdOverride) {
     typeof custRef === 'string' ? custRef : custRef?.id || null;
 
   const items = subscription.items?.data || [];
-  const stripePriceId = items[0]?.price?.id || null;
-  const plan = resolvePlanFromSubscription(subscription);
+  const priceRaw = items[0]?.price;
+  const stripePriceId =
+    typeof priceRaw === 'string'
+      ? priceRaw
+      : priceRaw && typeof priceRaw === 'object'
+        ? priceRaw.id || null
+        : null;
+  let plan = resolvePlanFromSubscription(subscription);
+  const override = opts?.planOverride;
+  // transportSubscribe just set this price via getPriceId(period) — use it when Stripe
+  // price expand/mapping fails (unexpanded price id → UNKNOWN).
+  if (override === 'YEARLY' || override === 'MONTHLY') {
+    if (plan === 'UNKNOWN' || !plan) {
+      plan = override;
+    } else if (plan !== override) {
+      console.warn('[billing-service] plan mismatch vs subscribe period', {
+        subscriptionId: subId,
+        resolved: plan,
+        override,
+        stripePriceId,
+      });
+    }
+  }
   const stripeStatus = subscription.status || null;
   const status = mapStatus(stripeStatus);
   const hasProAccess = computeHasProAccess(stripeStatus);

@@ -78,10 +78,10 @@ function getPriceId(billingPeriod) {
   return id;
 }
 
-async function finalizeSubscriptionFlow(refreshed, userId) {
+async function finalizeSubscriptionFlow(refreshed, userId, planHint) {
   const subId = refreshed?.id ? String(refreshed.id) : null;
   const expanded = await stripe.subscriptions.retrieve(subId, {
-    expand: ['latest_invoice.payment_intent'],
+    expand: ['latest_invoice.payment_intent', 'items.data.price'],
   });
 
   const pi = expanded.latest_invoice?.payment_intent;
@@ -103,7 +103,9 @@ async function finalizeSubscriptionFlow(refreshed, userId) {
     );
   }
 
-  await persistSubscriptionFromStripe(expanded, String(userId));
+  const planOverride =
+    planHint === 'YEARLY' || planHint === 'MONTHLY' ? planHint : undefined;
+  await persistSubscriptionFromStripe(expanded, String(userId), { planOverride });
   await syncSubscriptionToSpring(expanded, String(userId));
   return { ok: true, subscriptionId: subId || undefined };
 }
@@ -217,13 +219,17 @@ exports.transportSubscribe = async ({ userId, email, fullName, billingPeriod, pa
   if (existingSubId) {
     let existing;
     try {
-      existing = await stripe.subscriptions.retrieve(existingSubId);
+      existing = await stripe.subscriptions.retrieve(existingSubId, {
+        expand: ['items.data.price'],
+      });
     } catch {
       existing = null;
     }
 
     if (existing && ['active', 'trialing', 'past_due'].includes(existing.status)) {
-      const currentPrice = existing.items?.data?.[0]?.price?.id;
+      const priceRaw = existing.items?.data?.[0]?.price;
+      const currentPrice =
+        typeof priceRaw === 'string' ? priceRaw : priceRaw?.id || null;
       const itemId = existing.items?.data?.[0]?.id;
       if (currentPrice === priceId) {
         throw new HttpError(400, 'Vous êtes déjà abonné à cette période.', 'ALREADY_SUBSCRIBED');
@@ -233,16 +239,23 @@ exports.transportSubscribe = async ({ userId, email, fullName, billingPeriod, pa
       await stripe.subscriptions.update(existingSubId, {
         items: [{ id: itemId, price: priceId }],
         proration_behavior: 'create_prorations',
+        // Reset cycle so YEARLY gets a year-long period (not the leftover monthly end).
+        billing_cycle_anchor: 'now',
         default_payment_method: pmId,
+        metadata: {
+          ...(existing.metadata || {}),
+          userId: String(userId),
+          billingPeriod: period,
+        },
       });
       const expanded = await stripe.subscriptions.retrieve(existingSubId, {
-        expand: ['latest_invoice.payment_intent'],
+        expand: ['latest_invoice.payment_intent', 'items.data.price'],
       });
-      return finalizeSubscriptionFlow(expanded, userId);
+      return finalizeSubscriptionFlow(expanded, userId, period);
     }
   }
 
-  const meta = { userId: String(userId) };
+  const meta = { userId: String(userId), billingPeriod: period };
   if (planId) meta.planId = String(planId);
   if (planName) meta.planName = String(planName);
 
@@ -252,10 +265,10 @@ exports.transportSubscribe = async ({ userId, email, fullName, billingPeriod, pa
     default_payment_method: pmId,
     metadata: meta,
     payment_settings: { save_default_payment_method: 'on_subscription' },
-    expand: ['latest_invoice.payment_intent'],
+    expand: ['latest_invoice.payment_intent', 'items.data.price'],
   });
 
-  return finalizeSubscriptionFlow(subscription, userId);
+  return finalizeSubscriptionFlow(subscription, userId, period);
 };
 
 exports.transportConfirmPayment = async ({ userId, subscriptionId }) => {
@@ -263,7 +276,7 @@ exports.transportConfirmPayment = async ({ userId, subscriptionId }) => {
   if (!subId) throw new HttpError(400, 'subscriptionId est requis.', 'VALIDATION_ERROR');
 
   const refreshed = await stripe.subscriptions.retrieve(subId, {
-    expand: ['latest_invoice.payment_intent'],
+    expand: ['latest_invoice.payment_intent', 'items.data.price'],
   });
 
   const metaUid = refreshed.metadata?.userId ? String(refreshed.metadata.userId) : null;
@@ -281,7 +294,10 @@ exports.transportConfirmPayment = async ({ userId, subscriptionId }) => {
     throw new HttpError(400, 'Paiement encore incomplet. Finalisez l’authentification.', 'PAYMENT_INCOMPLETE');
   }
 
-  await persistSubscriptionFromStripe(refreshed, String(userId));
+  const metaPeriod = refreshed.metadata?.billingPeriod;
+  const planOverride =
+    metaPeriod === 'YEARLY' || metaPeriod === 'MONTHLY' ? metaPeriod : undefined;
+  await persistSubscriptionFromStripe(refreshed, String(userId), { planOverride });
   await syncSubscriptionToSpring(refreshed, String(userId));
   return { ok: true, subscriptionId: subId };
 };

@@ -63,9 +63,16 @@ async function syncSubscriptionToSpring(subscription, userIdOverride) {
 
   const items = subscription.items?.data || [];
   const firstItem = items[0];
-  const priceId = firstItem?.price?.id || null;
+  const priceRaw = firstItem?.price;
+  const priceId =
+    typeof priceRaw === 'string'
+      ? priceRaw
+      : priceRaw && typeof priceRaw === 'object'
+        ? priceRaw.id || null
+        : null;
   // Prefer interval-based detection (more robust than priceId equality across envs).
-  const interval = firstItem?.price?.recurring?.interval || null; // "month" | "year" | ...
+  const interval =
+    priceRaw && typeof priceRaw === 'object' ? priceRaw.recurring?.interval || null : null; // "month" | "year" | ...
   const plan =
     interval === 'year'
       ? 'YEARLY'
