@@ -1,23 +1,25 @@
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const axios = require('axios');
 
-const PRICE_ID_MONTHLY = process.env.STRIPE_PRICE_ID_MONTHLY;
-const PRICE_ID_YEARLY = process.env.STRIPE_PRICE_ID_YEARLY;
-
 const SPRING_SYNC_URL = process.env.SPRING_SYNC_URL;
 const SPRING_SYNC_API_KEY = process.env.SPRING_SYNC_API_KEY;
 
 // --- helpers ---
 
 function resolvePriceId(plan) {
-  if (plan === 'MONTHLY') return PRICE_ID_MONTHLY;
-  if (plan === 'YEARLY') return PRICE_ID_YEARLY;
+  const monthly = (process.env.STRIPE_PRICE_ID_MONTHLY || '').trim();
+  const yearly = (process.env.STRIPE_PRICE_ID_YEARLY || '').trim();
+  if (plan === 'MONTHLY') return monthly;
+  if (plan === 'YEARLY') return yearly;
   throw new Error('Invalid plan');
 }
 
 function mapPlanByPriceId(priceId) {
-  if (priceId === PRICE_ID_MONTHLY) return 'MONTHLY';
-  if (priceId === PRICE_ID_YEARLY) return 'YEARLY';
+  if (!priceId) return 'UNKNOWN';
+  const monthly = (process.env.STRIPE_PRICE_ID_MONTHLY || '').trim();
+  const yearly = (process.env.STRIPE_PRICE_ID_YEARLY || '').trim();
+  if (yearly && priceId === yearly) return 'YEARLY';
+  if (monthly && priceId === monthly) return 'MONTHLY';
   return 'UNKNOWN';
 }
 
@@ -63,15 +65,21 @@ async function syncSubscriptionToSpring(subscription, userIdOverride) {
 
   const items = subscription.items?.data || [];
   const firstItem = items[0];
-  const priceId = firstItem?.price?.id || null;
-  // Prefer interval-based detection (more robust than priceId equality across envs).
-  const interval = firstItem?.price?.recurring?.interval || null; // "month" | "year" | ...
+  const priceObj = firstItem?.price;
+  const priceId = typeof priceObj === 'string' ? priceObj : priceObj?.id || null;
+  const interval = typeof priceObj === 'object' ? priceObj?.recurring?.interval || null : null;
+  const fromMeta = subscription.metadata?.billingPeriod;
+  const fromPriceId = mapPlanByPriceId(priceId);
   const plan =
-    interval === 'year'
-      ? 'YEARLY'
-      : interval === 'month'
-        ? 'MONTHLY'
-        : mapPlanByPriceId(priceId);
+    fromMeta === 'YEARLY' || fromMeta === 'MONTHLY'
+      ? fromMeta
+      : fromPriceId !== 'UNKNOWN'
+        ? fromPriceId
+        : interval === 'year'
+          ? 'YEARLY'
+          : interval === 'month'
+            ? 'MONTHLY'
+            : 'UNKNOWN';
   const status = mapStatus(subscription.status);
   const currentPeriodEndIso = toIsoFromEpochSeconds(subscription.current_period_end);
 

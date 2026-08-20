@@ -17,7 +17,7 @@ const billingSubscriptionSchema = new mongoose.Schema(
     /** Mapped for downstream sync (ACTIVE, CANCELED, …) — same semantics as stripeService.mapStatus */
     status: { type: String, trim: true, default: 'UNKNOWN' },
 
-    /** Whether the user should have Pro access (active, trialing, past_due). */
+    /** Whether the user should have Pro access (set true only after invoice.paid). */
     hasProAccess: { type: Boolean, default: false },
 
     currentPeriodEnd: { type: Date, default: null },

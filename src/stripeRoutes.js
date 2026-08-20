@@ -6,16 +6,37 @@ const {
   createCheckoutSession,
   createEmbeddedCheckoutSession,
   createPortalSession,
-  handleSubscriptionChange
+  handleSubscriptionChange,
+  syncSubscriptionToSpring,
 } = require('./stripeService');
 const { isBillingDbConfigured } = require('./db');
 const WebhookEvent = require('./models/WebhookEvent');
-const { getSubscriptionSnapshotForUser } = require('./subscriptionPersistence');
+const { persistSubscriptionFromStripe, getSubscriptionSnapshotForUser } = require('./subscriptionPersistence');
 const transportRoutes = require('./transportRoutes');
 
 const router = express.Router();
 
 router.use(transportRoutes);
+
+function invoiceSubscriptionId(invoice) {
+  if (!invoice) return null;
+  const direct = invoice.subscription;
+  if (direct) return String(typeof direct === 'string' ? direct : direct.id);
+  const nested = invoice.parent?.subscription_details?.subscription;
+  if (nested) return String(typeof nested === 'string' ? nested : nested.id);
+  return null;
+}
+
+async function persistInvoiceOutcome(invoice, extras) {
+  const subId = invoiceSubscriptionId(invoice);
+  if (!subId) return;
+  const subscription = await stripeLib.subscriptions.retrieve(subId, {
+    expand: ['items.data.price'],
+  });
+  const userId = invoice.metadata?.userId || subscription.metadata?.userId;
+  await persistSubscriptionFromStripe(subscription, userId, extras);
+  await syncSubscriptionToSpring(subscription, userId);
+}
 
 function requireInternalKey(req, res) {
   const expected = process.env.SPRING_SYNC_API_KEY;
@@ -113,11 +134,17 @@ router.post(
         case 'checkout.session.completed': {
           const session = event.data.object;
           if (session.subscription) {
-            const subscription = await stripeLib.subscriptions.retrieve(
-              session.subscription
-            );
+            const subscription = await stripeLib.subscriptions.retrieve(session.subscription, {
+              expand: ['items.data.price'],
+            });
             const userIdFromCheckout = session.metadata?.userId;
-            await handleSubscriptionChange(subscription, userIdFromCheckout);
+            const paid =
+              session.payment_status === 'paid' ||
+              (session.payment_status === 'no_payment_required' && session.status === 'complete');
+            await persistSubscriptionFromStripe(subscription, userIdFromCheckout, {
+              paymentConfirmed: Boolean(paid),
+            });
+            await syncSubscriptionToSpring(subscription, userIdFromCheckout);
           }
           break;
         }
@@ -125,8 +152,32 @@ router.post(
         case 'customer.subscription.created':
         case 'customer.subscription.updated':
         case 'customer.subscription.deleted': {
-          const subscription = event.data.object;
-          await handleSubscriptionChange(subscription, subscription.metadata?.userId);
+          const raw = event.data.object;
+          let subscription = raw;
+          try {
+            subscription = await stripeLib.subscriptions.retrieve(raw.id, {
+              expand: ['items.data.price'],
+            });
+          } catch (err) {
+            console.warn('[billing-service] webhook subscription retrieve failed, using event payload:', err?.message || err);
+          }
+          await handleSubscriptionChange(subscription, subscription.metadata?.userId || raw.metadata?.userId);
+          break;
+        }
+
+        case 'invoice.paid':
+        case 'invoice_payment.paid': {
+          const obj = event.data.object;
+          const invoice =
+            event.type === 'invoice_payment.paid' && obj?.invoice
+              ? await stripeLib.invoices.retrieve(String(obj.invoice))
+              : obj;
+          await persistInvoiceOutcome(invoice, { paymentConfirmed: true });
+          break;
+        }
+
+        case 'invoice.payment_failed': {
+          await persistInvoiceOutcome(event.data.object, { paymentFailed: true });
           break;
         }
 
@@ -239,6 +290,32 @@ router.get('/internal/subscription', async (req, res) => {
   } catch (err) {
     console.error('Error reading internal subscription', err);
     res.status(500).json({ error: 'Failed to read subscription' });
+  }
+});
+
+router.post('/internal/invoice-outcome', bodyParser.json(), async (req, res) => {
+  try {
+    if (!requireInternalKey(req, res)) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    const subscriptionId = String(req.body?.subscriptionId || '').trim();
+    const outcome = String(req.body?.outcome || '').trim().toLowerCase();
+    if (!subscriptionId) {
+      return res.status(400).json({ error: 'subscriptionId is required' });
+    }
+    if (outcome !== 'paid' && outcome !== 'failed') {
+      return res.status(400).json({ error: 'outcome must be paid or failed' });
+    }
+    const subscription = await stripeLib.subscriptions.retrieve(subscriptionId, {
+      expand: ['items.data.price'],
+    });
+    const extras = outcome === 'paid' ? { paymentConfirmed: true } : { paymentFailed: true };
+    await persistSubscriptionFromStripe(subscription, subscription.metadata?.userId, extras);
+    await syncSubscriptionToSpring(subscription, subscription.metadata?.userId);
+    return res.json({ ok: true, hasProAccess: extras.paymentConfirmed === true });
+  } catch (err) {
+    console.error('Error applying invoice outcome', err);
+    res.status(500).json({ error: 'Failed to apply invoice outcome' });
   }
 });
 

@@ -3,24 +3,59 @@ const { isBillingDbConfigured } = require('./db');
 const BillingCustomer = require('./models/BillingCustomer');
 const BillingSubscription = require('./models/BillingSubscription');
 
-const PRICE_ID_MONTHLY = process.env.STRIPE_PRICE_ID_MONTHLY;
-const PRICE_ID_YEARLY = process.env.STRIPE_PRICE_ID_YEARLY;
-
 function mapPlanByPriceId(priceId) {
   if (!priceId) return 'UNKNOWN';
-  if (priceId === PRICE_ID_MONTHLY) return 'MONTHLY';
-  if (priceId === PRICE_ID_YEARLY) return 'YEARLY';
+  const monthly = (process.env.STRIPE_PRICE_ID_MONTHLY || '').trim();
+  const yearly = (process.env.STRIPE_PRICE_ID_YEARLY || '').trim();
+  if (yearly && priceId === yearly) return 'YEARLY';
+  if (monthly && priceId === monthly) return 'MONTHLY';
   return 'UNKNOWN';
 }
 
-function resolvePlanFromSubscription(subscription) {
+async function resolvePlanFromSubscription(subscription) {
   const items = subscription.items?.data || [];
   const firstItem = items[0];
-  const priceId = firstItem?.price?.id || null;
-  const interval = firstItem?.price?.recurring?.interval || null;
+  let price = firstItem?.price;
+  let priceId = typeof price === 'string' ? price : price?.id || null;
+  let interval = typeof price === 'object' && price?.recurring?.interval ? price.recurring.interval : null;
+
+  if (!interval && priceId) {
+    try {
+      const fetched = await stripe.prices.retrieve(priceId);
+      interval = fetched?.recurring?.interval || null;
+      priceId = fetched?.id || priceId;
+    } catch (err) {
+      console.warn('[billing-service] resolvePlanFromSubscription price retrieve failed:', err?.message || err);
+    }
+  }
+
+  const fromMeta = subscription.metadata?.billingPeriod;
+  if (fromMeta === 'YEARLY' || fromMeta === 'MONTHLY') return fromMeta;
+
+  const fromPriceId = mapPlanByPriceId(priceId);
+  if (fromPriceId !== 'UNKNOWN') return fromPriceId;
+
   if (interval === 'year') return 'YEARLY';
   if (interval === 'month') return 'MONTHLY';
-  return mapPlanByPriceId(priceId);
+  return 'UNKNOWN';
+}
+
+function subscriptionPeriodEnd(subscription) {
+  return (
+    toDateFromEpochSeconds(subscription.current_period_end) ||
+    toDateFromEpochSeconds(subscription.items?.data?.[0]?.current_period_end)
+  );
+}
+
+function pickBestSubscriptionRow(rows) {
+  if (!rows?.length) return null;
+  return [...rows].sort((a, b) => {
+    if (a.plan === 'YEARLY' && b.plan !== 'YEARLY') return -1;
+    if (b.plan === 'YEARLY' && a.plan !== 'YEARLY') return 1;
+    const aEnd = a.currentPeriodEnd ? new Date(a.currentPeriodEnd).getTime() : 0;
+    const bEnd = b.currentPeriodEnd ? new Date(b.currentPeriodEnd).getTime() : 0;
+    return bEnd - aEnd;
+  })[0];
 }
 
 function mapStatus(stripeStatus) {
@@ -46,6 +81,33 @@ function mapStatus(stripeStatus) {
 
 function computeHasProAccess(stripeStatus) {
   return ['active', 'trialing', 'past_due'].includes(stripeStatus);
+}
+
+function isTerminalStripeStatus(stripeStatus) {
+  return ['canceled', 'unpaid', 'incomplete_expired'].includes(String(stripeStatus || ''));
+}
+
+/**
+ * Pro is granted only after invoice.paid (paymentConfirmed).
+ * Client subscribe / subscription.updated must not unlock access (card OK ≠ funds captured).
+ */
+function resolvePersistedAccess({ stripeStatus, existing, extras = {} }) {
+  if (isTerminalStripeStatus(stripeStatus)) {
+    return { hasProAccess: false, status: mapStatus(stripeStatus) };
+  }
+  if (extras.paymentFailed) {
+    return { hasProAccess: false, status: 'UNPAID' };
+  }
+  if (extras.paymentConfirmed) {
+    return {
+      hasProAccess: computeHasProAccess(stripeStatus),
+      status: mapStatus(stripeStatus),
+    };
+  }
+  if (existing?.hasProAccess && computeHasProAccess(stripeStatus)) {
+    return { hasProAccess: true, status: mapStatus(stripeStatus) };
+  }
+  return { hasProAccess: false, status: 'PENDING' };
 }
 
 function toDateFromEpochSeconds(epochOrNull) {
@@ -77,7 +139,7 @@ async function resolveUserId(subscription, userIdOverride) {
 /**
  * Upsert subscription + customer into the billing MongoDB cluster.
  */
-async function persistSubscriptionFromStripe(subscription, userIdOverride) {
+async function persistSubscriptionFromStripe(subscription, userIdOverride, extras = {}) {
   if (!isBillingDbConfigured()) {
     return { skipped: true, reason: 'no_billing_db' };
   }
@@ -101,12 +163,20 @@ async function persistSubscriptionFromStripe(subscription, userIdOverride) {
     typeof custRef === 'string' ? custRef : custRef?.id || null;
 
   const items = subscription.items?.data || [];
-  const stripePriceId = items[0]?.price?.id || null;
-  const plan = resolvePlanFromSubscription(subscription);
+  const firstPrice = items[0]?.price;
+  const stripePriceId = typeof firstPrice === 'string' ? firstPrice : firstPrice?.id || null;
+  const plan =
+    extras.planOverride === 'YEARLY' || extras.planOverride === 'MONTHLY'
+      ? extras.planOverride
+      : await resolvePlanFromSubscription(subscription);
   const stripeStatus = subscription.status || null;
-  const status = mapStatus(stripeStatus);
-  const hasProAccess = computeHasProAccess(stripeStatus);
-  const currentPeriodEnd = toDateFromEpochSeconds(subscription.current_period_end);
+  const existing = await BillingSubscription.findOne({ stripeSubscriptionId: subId }).lean();
+  const { status, hasProAccess } = resolvePersistedAccess({
+    stripeStatus,
+    existing,
+    extras,
+  });
+  const currentPeriodEnd = subscriptionPeriodEnd(subscription);
   const cancelAtPeriodEnd = Boolean(subscription.cancel_at_period_end);
 
   if (stripeCustomerId) {
@@ -143,16 +213,65 @@ async function persistSubscriptionFromStripe(subscription, userIdOverride) {
   return { skipped: false, userId, stripeSubscriptionId: subId };
 }
 
-async function getSubscriptionSnapshotForUser(userId) {
+async function reconcileUserSubscriptionsFromStripe(userId) {
+  if (!isBillingDbConfigured()) return { skipped: true, reason: 'no_billing_db' };
+  const uid = String(userId || '').trim();
+  if (!uid) return { skipped: true, reason: 'no_user_id' };
+
+  const customer = await BillingCustomer.findOne({ userId: uid }).lean();
+  if (!customer?.stripeCustomerId) return { skipped: true, reason: 'no_customer' };
+
+  const listed = await stripe.subscriptions.list({
+    customer: customer.stripeCustomerId,
+    status: 'all',
+    limit: 20,
+    expand: ['data.items.data.price'],
+  });
+
+  for (const sub of listed.data || []) {
+    await persistSubscriptionFromStripe(sub, uid);
+  }
+
+  return { skipped: false, count: (listed.data || []).length };
+}
+
+async function getSubscriptionSnapshotForUser(userId, { forceReconcile = false } = {}) {
   if (!isBillingDbConfigured()) {
     return null;
   }
   const uid = String(userId || '').trim();
   if (!uid) return null;
 
-  const sub = await BillingSubscription.findOne({ userId: uid, hasProAccess: true })
-    .sort({ currentPeriodEnd: -1 })
-    .lean();
+  const listedRows = await BillingSubscription.find({ userId: uid }).lean();
+  const activeRows = listedRows.filter((row) => row.hasProAccess);
+  const staleMs = 5 * 60 * 1000;
+  const inconsistentPlan = activeRows.some((row) => {
+    if (row.plan === 'MONTHLY' && row.stripePriceId === (process.env.STRIPE_PRICE_ID_YEARLY || '').trim()) return true;
+    if (row.plan === 'YEARLY' && row.stripePriceId === (process.env.STRIPE_PRICE_ID_MONTHLY || '').trim()) return true;
+    return false;
+  });
+  const needsReconcile =
+    forceReconcile ||
+    activeRows.length > 1 ||
+    inconsistentPlan ||
+    activeRows.some((row) => {
+      if (!row.lastStripePayloadAt) return true;
+      return Date.now() - new Date(row.lastStripePayloadAt).getTime() > staleMs;
+    });
+
+  if (needsReconcile) {
+    try {
+      await reconcileUserSubscriptionsFromStripe(uid);
+    } catch (err) {
+      console.warn('[billing-service] reconcileUserSubscriptionsFromStripe failed:', err?.message || err);
+    }
+  }
+
+  const freshRows = await BillingSubscription.find({ userId: uid }).lean();
+  const sub =
+    pickBestSubscriptionRow(freshRows.filter((row) => row.hasProAccess)) ||
+    pickBestSubscriptionRow(freshRows.filter((row) => String(row.status) === 'PENDING')) ||
+    pickBestSubscriptionRow(freshRows);
 
   const customer = await BillingCustomer.findOne({ userId: uid }).lean();
 
@@ -186,6 +305,8 @@ async function getSubscriptionSnapshotForUser(userId) {
 module.exports = {
   persistSubscriptionFromStripe,
   getSubscriptionSnapshotForUser,
+  reconcileUserSubscriptionsFromStripe,
   mapStatus,
   resolvePlanFromSubscription,
+  resolvePersistedAccess,
 };
