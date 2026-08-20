@@ -2,7 +2,7 @@ const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const axios = require('axios');
 const BillingCustomer = require('./models/BillingCustomer');
 const BillingSubscription = require('./models/BillingSubscription');
-const { persistSubscriptionFromStripe } = require('./subscriptionPersistence');
+const { persistSubscriptionFromStripe, reconcileUserSubscriptionsFromStripe } = require('./subscriptionPersistence');
 const { syncSubscriptionToSpring } = require('./stripeService');
 
 class HttpError extends Error {
@@ -11,6 +11,12 @@ class HttpError extends Error {
     this.status = status;
     this.code = code;
   }
+}
+
+function normalizeBillingPeriod(value) {
+  const v = String(value || '').trim().toUpperCase();
+  if (['YEARLY', 'YEAR', 'ANNUAL', 'ANNUEL'].includes(v)) return 'YEARLY';
+  return 'MONTHLY';
 }
 
 function formatCardBrandForApi(brand) {
@@ -47,12 +53,41 @@ async function resolveOrCreateCustomer(userId, email, fullName) {
   return customer.id;
 }
 
+function pickBestSubscriptionRow(rows) {
+  if (!rows?.length) return null;
+  return [...rows].sort((a, b) => {
+    if (a.plan === 'YEARLY' && b.plan !== 'YEARLY') return -1;
+    if (b.plan === 'YEARLY' && a.plan !== 'YEARLY') return 1;
+    const aEnd = a.currentPeriodEnd ? new Date(a.currentPeriodEnd).getTime() : 0;
+    const bEnd = b.currentPeriodEnd ? new Date(b.currentPeriodEnd).getTime() : 0;
+    return bEnd - aEnd;
+  })[0];
+}
+
 async function findStripeSubscriptionIdForUser(userId) {
   const uid = String(userId);
-  let row = await BillingSubscription.findOne({ userId: uid, hasProAccess: true }).lean();
-  if (row?.stripeSubscriptionId) return row.stripeSubscriptionId;
-  row = await BillingSubscription.findOne({ userId: uid }).sort({ updatedAt: -1 }).lean();
+  const activeRows = await BillingSubscription.find({ userId: uid, hasProAccess: true }).lean();
+  const best = pickBestSubscriptionRow(activeRows);
+  if (best?.stripeSubscriptionId) return best.stripeSubscriptionId;
+  const row = await BillingSubscription.findOne({ userId: uid }).sort({ updatedAt: -1 }).lean();
   return row?.stripeSubscriptionId || null;
+}
+
+async function cancelStripeSubscriptionImmediately(subId) {
+  if (typeof stripe.subscriptions.cancel === 'function') {
+    await stripe.subscriptions.cancel(subId, { prorate: false, invoice_now: false });
+  } else {
+    await stripe.subscriptions.del(subId, { prorate: false });
+  }
+}
+
+function isPeriodSwitch(currentPriceId, nextPriceId) {
+  const monthlyId = getPriceId('MONTHLY');
+  const yearlyId = getPriceId('YEARLY');
+  return (
+    (currentPriceId === monthlyId && nextPriceId === yearlyId) ||
+    (currentPriceId === yearlyId && nextPriceId === monthlyId)
+  );
 }
 
 /** Attache seulement si la PM n’est pas déjà sur ce client (ré-abonnement avec carte enregistrée). */
@@ -68,34 +103,98 @@ async function attachPaymentMethodIfNeeded(customerId, pmId) {
 
 function getPriceId(billingPeriod) {
   const yearly = billingPeriod === 'YEARLY';
+  const monthlyId = (process.env.STRIPE_PRICE_ID_MONTHLY || '').trim();
+  const yearlyId = (process.env.STRIPE_PRICE_ID_YEARLY || '').trim();
   if (yearly) {
-    const id = (process.env.STRIPE_PRICE_ID_YEARLY || '').trim();
-    if (!id) throw new HttpError(503, 'Prix annuel non configuré (STRIPE_PRICE_ID_YEARLY).', 'STRIPE_PLAN_NOT_CONFIGURED');
-    return id;
+    if (!yearlyId) throw new HttpError(503, 'Prix annuel non configuré (STRIPE_PRICE_ID_YEARLY).', 'STRIPE_PLAN_NOT_CONFIGURED');
+    if (monthlyId && yearlyId === monthlyId) {
+      throw new HttpError(503, 'STRIPE_PRICE_ID_YEARLY et STRIPE_PRICE_ID_MONTHLY sont identiques.', 'STRIPE_PLAN_NOT_CONFIGURED');
+    }
+    return yearlyId;
   }
-  const id = (process.env.STRIPE_PRICE_ID_MONTHLY || '').trim();
-  if (!id) throw new HttpError(503, 'Prix mensuel non configuré (STRIPE_PRICE_ID_MONTHLY).', 'STRIPE_PLAN_NOT_CONFIGURED');
-  return id;
+  if (!monthlyId) throw new HttpError(503, 'Prix mensuel non configuré (STRIPE_PRICE_ID_MONTHLY).', 'STRIPE_PLAN_NOT_CONFIGURED');
+  return monthlyId;
 }
 
-async function finalizeSubscriptionFlow(refreshed, userId, planHint) {
+async function resolveAndValidatePriceId(billingPeriod) {
+  const priceId = getPriceId(billingPeriod);
+  const expected = billingPeriod === 'YEARLY' ? 'year' : 'month';
+  let price;
+  try {
+    price = await stripe.prices.retrieve(priceId);
+  } catch (err) {
+    throw new HttpError(503, `Prix Stripe introuvable (${priceId}).`, 'STRIPE_PLAN_NOT_CONFIGURED');
+  }
+  const interval = price?.recurring?.interval || null;
+  if (interval && interval !== expected) {
+    throw new HttpError(
+      503,
+      billingPeriod === 'YEARLY'
+        ? `STRIPE_PRICE_ID_YEARLY is a ${interval}ly Stripe price, not yearly. Create a recurring yearly price (€200 / year) and update STRIPE_PRICE_ID_YEARLY on the billing service.`
+        : `STRIPE_PRICE_ID_MONTHLY is not a monthly Stripe price (interval=${interval}).`,
+      'STRIPE_PRICE_INTERVAL_MISMATCH'
+    );
+  }
+  return priceId;
+}
+
+async function assertSubscriptionMatchesPeriod(subscription, period) {
+  const item = subscription.items?.data?.[0];
+  const price = item?.price;
+  let interval = typeof price === 'object' ? price?.recurring?.interval : null;
+  const priceId = typeof price === 'string' ? price : price?.id;
+  if (!interval && priceId) {
+    try {
+      const fetched = await stripe.prices.retrieve(priceId);
+      interval = fetched?.recurring?.interval || null;
+    } catch (err) {
+      console.warn('[transport] assertSubscriptionMatchesPeriod price retrieve failed:', err?.message || err);
+    }
+  }
+  const expected = period === 'YEARLY' ? 'year' : 'month';
+  if (interval && interval !== expected) {
+    console.error('[transport] subscription interval mismatch', {
+      period,
+      interval,
+      priceId,
+      subscriptionId: subscription.id,
+    });
+    throw new HttpError(
+      500,
+      'L’abonnement créé ne correspond pas à la période demandée.',
+      'STRIPE_INTERVAL_MISMATCH'
+    );
+  }
+}
+
+async function finalizeSubscriptionFlow(refreshed, userId, expectedPeriod = null) {
   const subId = refreshed?.id ? String(refreshed.id) : null;
   const expanded = await stripe.subscriptions.retrieve(subId, {
     expand: ['latest_invoice.payment_intent', 'items.data.price'],
   });
 
+  if (expectedPeriod) {
+    await assertSubscriptionMatchesPeriod(expanded, expectedPeriod);
+  }
+
   const pi = expanded.latest_invoice?.payment_intent;
   const piObj = typeof pi === 'string' ? null : pi;
 
   if (piObj && piObj.status === 'requires_action') {
+    await persistSubscriptionFromStripe(expanded, String(userId), { planOverride: expectedPeriod });
     return {
       requiresAction: true,
       clientSecret: piObj.client_secret || undefined,
       subscriptionId: subId || undefined,
+      pending: true,
     };
   }
 
-  if (['incomplete', 'incomplete_expired'].includes(expanded.status)) {
+  if (piObj && ['requires_payment_method', 'canceled'].includes(piObj.status)) {
+    await persistSubscriptionFromStripe(expanded, String(userId), {
+      planOverride: expectedPeriod,
+      paymentFailed: true,
+    });
     throw new HttpError(
       402,
       'Le paiement de l’abonnement a échoué ou est incomplet. Vérifiez votre carte.',
@@ -103,11 +202,33 @@ async function finalizeSubscriptionFlow(refreshed, userId, planHint) {
     );
   }
 
-  const planOverride =
-    planHint === 'YEARLY' || planHint === 'MONTHLY' ? planHint : undefined;
-  await persistSubscriptionFromStripe(expanded, String(userId), { planOverride });
+  if (expanded.status === 'incomplete_expired') {
+    await persistSubscriptionFromStripe(expanded, String(userId), {
+      planOverride: expectedPeriod,
+      paymentFailed: true,
+    });
+    throw new HttpError(
+      402,
+      'Le paiement de l’abonnement a échoué ou est incomplet. Vérifiez votre carte.',
+      'PAYMENT_FAILED'
+    );
+  }
+
+  const inv = expanded.latest_invoice && typeof expanded.latest_invoice === 'object' ? expanded.latest_invoice : null;
+  const settled =
+    (piObj && piObj.status === 'succeeded') ||
+    String(inv?.status || '') === 'paid' ||
+    ['active', 'trialing'].includes(String(expanded.status || ''));
+
+  await persistSubscriptionFromStripe(expanded, String(userId), {
+    planOverride: expectedPeriod,
+    ...(settled ? { paymentConfirmed: true } : {}),
+  });
+  await reconcileUserSubscriptionsFromStripe(String(userId)).catch((err) => {
+    console.warn('[transport] reconcile after subscribe:', err?.message || err);
+  });
   await syncSubscriptionToSpring(expanded, String(userId));
-  return { ok: true, subscriptionId: subId || undefined };
+  return { ok: true, pending: !settled, subscriptionId: subId || undefined };
 }
 
 exports.transportSetupIntent = async ({ userId, email, fullName }) => {
@@ -205,8 +326,9 @@ exports.transportSubscribe = async ({ userId, email, fullName, billingPeriod, pa
   if (!pmId) throw new HttpError(400, 'paymentMethodId est requis.', 'VALIDATION_ERROR');
   if (!userId || !email) throw new HttpError(400, 'userId et email sont requis.', 'VALIDATION_ERROR');
 
-  const period = billingPeriod === 'YEARLY' ? 'YEARLY' : 'MONTHLY';
-  const priceId = getPriceId(period);
+  const period = normalizeBillingPeriod(billingPeriod);
+  const priceId = await resolveAndValidatePriceId(period);
+  console.info('[transport] subscribe', { userId: String(userId), billingPeriod: period, rawBillingPeriod: billingPeriod, priceId });
   const customerId = await resolveOrCreateCustomer(userId, email, fullName || '');
 
   await attachPaymentMethodIfNeeded(customerId, pmId);
@@ -227,31 +349,44 @@ exports.transportSubscribe = async ({ userId, email, fullName, billingPeriod, pa
     }
 
     if (existing && ['active', 'trialing', 'past_due'].includes(existing.status)) {
-      const priceRaw = existing.items?.data?.[0]?.price;
-      const currentPrice =
-        typeof priceRaw === 'string' ? priceRaw : priceRaw?.id || null;
-      const itemId = existing.items?.data?.[0]?.id;
-      if (currentPrice === priceId) {
+      const firstItem = existing.items?.data?.[0];
+      const priceObj = typeof firstItem?.price === 'object' ? firstItem.price : null;
+      const currentPrice = typeof firstItem?.price === 'string' ? firstItem.price : priceObj?.id;
+      const currentInterval = priceObj?.recurring?.interval || null;
+      const itemId = firstItem?.id;
+      const wantsYearly = period === 'YEARLY';
+      const wantsMonthly = period === 'MONTHLY';
+      const intervalMismatch =
+        (wantsYearly && currentInterval === 'month') || (wantsMonthly && currentInterval === 'year');
+
+      if (currentPrice === priceId && !intervalMismatch) {
         throw new HttpError(400, 'Vous êtes déjà abonné à cette période.', 'ALREADY_SUBSCRIBED');
       }
-      if (!itemId) throw new HttpError(500, 'Impossible de mettre à jour l’abonnement.', 'STRIPE_ERROR');
 
-      await stripe.subscriptions.update(existingSubId, {
-        items: [{ id: itemId, price: priceId }],
-        proration_behavior: 'create_prorations',
-        // Reset cycle so YEARLY gets a year-long period (not the leftover monthly end).
-        billing_cycle_anchor: 'now',
-        default_payment_method: pmId,
-        metadata: {
-          ...(existing.metadata || {}),
-          userId: String(userId),
-          billingPeriod: period,
-        },
-      });
-      const expanded = await stripe.subscriptions.retrieve(existingSubId, {
-        expand: ['latest_invoice.payment_intent', 'items.data.price'],
-      });
-      return finalizeSubscriptionFlow(expanded, userId, period);
+      if (isPeriodSwitch(currentPrice, priceId) || intervalMismatch) {
+        await cancelStripeSubscriptionImmediately(existingSubId);
+        const canceled = await stripe.subscriptions.retrieve(existingSubId);
+        await persistSubscriptionFromStripe(canceled, String(userId));
+      } else {
+        if (!itemId) throw new HttpError(500, 'Impossible de mettre à jour l’abonnement.', 'STRIPE_ERROR');
+        await stripe.subscriptions.update(existingSubId, {
+          items: [{ id: itemId, price: priceId }],
+          proration_behavior: 'create_prorations',
+          cancel_at_period_end: false,
+          // Reset cycle so YEARLY gets a year-long period (not the leftover monthly end).
+          billing_cycle_anchor: 'now',
+          default_payment_method: pmId,
+          metadata: {
+            ...(existing.metadata || {}),
+            userId: String(userId),
+            billingPeriod: period,
+          },
+        });
+        const expanded = await stripe.subscriptions.retrieve(existingSubId, {
+          expand: ['latest_invoice.payment_intent', 'items.data.price'],
+        });
+        return finalizeSubscriptionFlow(expanded, userId, period);
+      }
     }
   }
 
@@ -287,19 +422,28 @@ exports.transportConfirmPayment = async ({ userId, subscriptionId }) => {
     if (own !== subId) throw new HttpError(403, 'Abonnement incohérent.', 'FORBIDDEN');
   }
 
-  if (['canceled', 'unpaid'].includes(refreshed.status)) {
+  if (['canceled', 'unpaid', 'incomplete_expired'].includes(refreshed.status)) {
+    await persistSubscriptionFromStripe(refreshed, String(userId), { paymentFailed: true });
     throw new HttpError(400, 'L’abonnement n’est pas actif.', 'VALIDATION_ERROR');
-  }
-  if (refreshed.status === 'incomplete') {
-    throw new HttpError(400, 'Paiement encore incomplet. Finalisez l’authentification.', 'PAYMENT_INCOMPLETE');
   }
 
   const metaPeriod = refreshed.metadata?.billingPeriod;
   const planOverride =
     metaPeriod === 'YEARLY' || metaPeriod === 'MONTHLY' ? metaPeriod : undefined;
-  await persistSubscriptionFromStripe(refreshed, String(userId), { planOverride });
+  const inv = refreshed.latest_invoice && typeof refreshed.latest_invoice === 'object' ? refreshed.latest_invoice : null;
+  const pi = inv?.payment_intent;
+  const piObj = pi && typeof pi === 'object' ? pi : null;
+  const settled =
+    (piObj && piObj.status === 'succeeded') ||
+    String(inv?.status || '') === 'paid' ||
+    ['active', 'trialing'].includes(String(refreshed.status || ''));
+
+  await persistSubscriptionFromStripe(refreshed, String(userId), {
+    planOverride,
+    ...(settled ? { paymentConfirmed: true } : {}),
+  });
   await syncSubscriptionToSpring(refreshed, String(userId));
-  return { ok: true, subscriptionId: subId };
+  return { ok: true, pending: !settled, subscriptionId: subId };
 };
 
 exports.transportPortal = async ({ userId }) => {
@@ -331,6 +475,7 @@ exports.transportCancel = async ({ userId }) => {
     }
   } catch (err) {
     console.error('[transport] cancel subscription:', err?.message || err);
+    throw new HttpError(502, 'Impossible d’annuler l’abonnement Stripe.', 'STRIPE_CANCEL_FAILED');
   }
 
   let refreshed;

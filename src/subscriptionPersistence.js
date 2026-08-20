@@ -3,32 +3,66 @@ const { isBillingDbConfigured } = require('./db');
 const BillingCustomer = require('./models/BillingCustomer');
 const BillingSubscription = require('./models/BillingSubscription');
 
-const PRICE_ID_MONTHLY = process.env.STRIPE_PRICE_ID_MONTHLY;
-const PRICE_ID_YEARLY = process.env.STRIPE_PRICE_ID_YEARLY;
-
 function mapPlanByPriceId(priceId) {
   if (!priceId) return 'UNKNOWN';
-  if (priceId === PRICE_ID_MONTHLY) return 'MONTHLY';
-  if (priceId === PRICE_ID_YEARLY) return 'YEARLY';
+  const monthly = (process.env.STRIPE_PRICE_ID_MONTHLY || '').trim();
+  const yearly = (process.env.STRIPE_PRICE_ID_YEARLY || '').trim();
+  if (yearly && priceId === yearly) return 'YEARLY';
+  if (monthly && priceId === monthly) return 'MONTHLY';
   return 'UNKNOWN';
 }
 
-function resolvePlanFromSubscription(subscription) {
+async function resolvePlanFromSubscription(subscription) {
   const items = subscription.items?.data || [];
   const firstItem = items[0];
   const priceRaw = firstItem?.price;
   // Stripe may return price as an expanded object or as a bare price id string.
-  const priceId =
+  let priceId =
     typeof priceRaw === 'string'
       ? priceRaw
       : priceRaw && typeof priceRaw === 'object'
         ? priceRaw.id || null
         : null;
-  const interval =
+  let interval =
     priceRaw && typeof priceRaw === 'object' ? priceRaw.recurring?.interval || null : null;
+
+  if (!interval && priceId) {
+    try {
+      const fetched = await stripe.prices.retrieve(priceId);
+      interval = fetched?.recurring?.interval || null;
+      priceId = fetched?.id || priceId;
+    } catch (err) {
+      console.warn('[billing-service] resolvePlanFromSubscription price retrieve failed:', err?.message || err);
+    }
+  }
+
+  const fromMeta = subscription.metadata?.billingPeriod;
+  if (fromMeta === 'YEARLY' || fromMeta === 'MONTHLY') return fromMeta;
+
+  const fromPriceId = mapPlanByPriceId(priceId);
+  if (fromPriceId !== 'UNKNOWN') return fromPriceId;
+
   if (interval === 'year') return 'YEARLY';
   if (interval === 'month') return 'MONTHLY';
-  return mapPlanByPriceId(priceId);
+  return 'UNKNOWN';
+}
+
+function subscriptionPeriodEnd(subscription) {
+  return (
+    toDateFromEpochSeconds(subscription.current_period_end) ||
+    toDateFromEpochSeconds(subscription.items?.data?.[0]?.current_period_end)
+  );
+}
+
+function pickBestSubscriptionRow(rows) {
+  if (!rows?.length) return null;
+  return [...rows].sort((a, b) => {
+    if (a.plan === 'YEARLY' && b.plan !== 'YEARLY') return -1;
+    if (b.plan === 'YEARLY' && a.plan !== 'YEARLY') return 1;
+    const aEnd = a.currentPeriodEnd ? new Date(a.currentPeriodEnd).getTime() : 0;
+    const bEnd = b.currentPeriodEnd ? new Date(b.currentPeriodEnd).getTime() : 0;
+    return bEnd - aEnd;
+  })[0];
 }
 
 function mapStatus(stripeStatus) {
@@ -54,6 +88,46 @@ function mapStatus(stripeStatus) {
 
 function computeHasProAccess(stripeStatus) {
   return ['active', 'trialing', 'past_due'].includes(stripeStatus);
+}
+
+function isTerminalStripeStatus(stripeStatus) {
+  return ['canceled', 'unpaid', 'incomplete_expired'].includes(String(stripeStatus || ''));
+}
+
+/**
+ * Infer paid charge from an expanded Stripe subscription (latest_invoice / PI).
+ * Used so subscribe/confirm can unlock Pro without waiting solely on invoice.paid webhook.
+ */
+function inferPaymentConfirmedFromStripe(subscription) {
+  const inv = subscription?.latest_invoice;
+  if (!inv || typeof inv !== 'object') return false;
+  if (String(inv.status || '') === 'paid') return true;
+  const pi = inv.payment_intent;
+  if (pi && typeof pi === 'object' && pi.status === 'succeeded') return true;
+  return false;
+}
+
+/**
+ * Pro is granted after paymentConfirmed (invoice.paid webhook or settled PI/invoice on persist).
+ * Bare subscription.updated without paid evidence must not unlock access.
+ */
+function resolvePersistedAccess({ stripeStatus, existing, extras = {} }) {
+  if (isTerminalStripeStatus(stripeStatus)) {
+    return { hasProAccess: false, status: mapStatus(stripeStatus) };
+  }
+  if (extras.paymentFailed) {
+    return { hasProAccess: false, status: 'UNPAID' };
+  }
+  if (extras.paymentConfirmed) {
+    return {
+      hasProAccess: computeHasProAccess(stripeStatus),
+      status: mapStatus(stripeStatus),
+    };
+  }
+  if (existing?.hasProAccess && computeHasProAccess(stripeStatus)) {
+    return { hasProAccess: true, status: mapStatus(stripeStatus) };
+  }
+  return { hasProAccess: false, status: 'PENDING' };
 }
 
 function toDateFromEpochSeconds(epochOrNull) {
@@ -88,7 +162,7 @@ async function resolveUserId(subscription, userIdOverride) {
  * @param {string} [userIdOverride]
  * @param {{ planOverride?: 'MONTHLY'|'YEARLY' }} [opts]
  */
-async function persistSubscriptionFromStripe(subscription, userIdOverride, opts = {}) {
+async function persistSubscriptionFromStripe(subscription, userIdOverride, extras = {}) {
   if (!isBillingDbConfigured()) {
     return { skipped: true, reason: 'no_billing_db' };
   }
@@ -119,8 +193,8 @@ async function persistSubscriptionFromStripe(subscription, userIdOverride, opts 
       : priceRaw && typeof priceRaw === 'object'
         ? priceRaw.id || null
         : null;
-  let plan = resolvePlanFromSubscription(subscription);
-  const override = opts?.planOverride;
+  let plan = await resolvePlanFromSubscription(subscription);
+  const override = extras?.planOverride;
   // transportSubscribe just set this price via getPriceId(period) — use it when Stripe
   // price expand/mapping fails (unexpanded price id → UNKNOWN).
   if (override === 'YEARLY' || override === 'MONTHLY') {
@@ -135,10 +209,24 @@ async function persistSubscriptionFromStripe(subscription, userIdOverride, opts 
       });
     }
   }
+
+  const mergedExtras = { ...extras };
+  if (
+    !mergedExtras.paymentFailed &&
+    !mergedExtras.paymentConfirmed &&
+    inferPaymentConfirmedFromStripe(subscription)
+  ) {
+    mergedExtras.paymentConfirmed = true;
+  }
+
   const stripeStatus = subscription.status || null;
-  const status = mapStatus(stripeStatus);
-  const hasProAccess = computeHasProAccess(stripeStatus);
-  const currentPeriodEnd = toDateFromEpochSeconds(subscription.current_period_end);
+  const existing = await BillingSubscription.findOne({ stripeSubscriptionId: subId }).lean();
+  const { status, hasProAccess } = resolvePersistedAccess({
+    stripeStatus,
+    existing,
+    extras: mergedExtras,
+  });
+  const currentPeriodEnd = subscriptionPeriodEnd(subscription);
   const cancelAtPeriodEnd = Boolean(subscription.cancel_at_period_end);
 
   if (stripeCustomerId) {
@@ -175,16 +263,69 @@ async function persistSubscriptionFromStripe(subscription, userIdOverride, opts 
   return { skipped: false, userId, stripeSubscriptionId: subId };
 }
 
-async function getSubscriptionSnapshotForUser(userId) {
+async function reconcileUserSubscriptionsFromStripe(userId) {
+  if (!isBillingDbConfigured()) return { skipped: true, reason: 'no_billing_db' };
+  const uid = String(userId || '').trim();
+  if (!uid) return { skipped: true, reason: 'no_user_id' };
+
+  const customer = await BillingCustomer.findOne({ userId: uid }).lean();
+  if (!customer?.stripeCustomerId) return { skipped: true, reason: 'no_customer' };
+
+  const listed = await stripe.subscriptions.list({
+    customer: customer.stripeCustomerId,
+    status: 'all',
+    limit: 20,
+    expand: ['data.items.data.price', 'data.latest_invoice.payment_intent'],
+  });
+
+  for (const sub of listed.data || []) {
+    await persistSubscriptionFromStripe(sub, uid);
+  }
+
+  return { skipped: false, count: (listed.data || []).length };
+}
+
+async function getSubscriptionSnapshotForUser(userId, { forceReconcile = false } = {}) {
   if (!isBillingDbConfigured()) {
     return null;
   }
   const uid = String(userId || '').trim();
   if (!uid) return null;
 
-  const sub = await BillingSubscription.findOne({ userId: uid, hasProAccess: true })
-    .sort({ currentPeriodEnd: -1 })
-    .lean();
+  const listedRows = await BillingSubscription.find({ userId: uid }).lean();
+  const activeRows = listedRows.filter((row) => row.hasProAccess);
+  const pendingRows = listedRows.filter(
+    (row) => !row.hasProAccess && String(row.status || '').toUpperCase() === 'PENDING'
+  );
+  const staleMs = 5 * 60 * 1000;
+  const inconsistentPlan = activeRows.some((row) => {
+    if (row.plan === 'MONTHLY' && row.stripePriceId === (process.env.STRIPE_PRICE_ID_YEARLY || '').trim()) return true;
+    if (row.plan === 'YEARLY' && row.stripePriceId === (process.env.STRIPE_PRICE_ID_MONTHLY || '').trim()) return true;
+    return false;
+  });
+  const needsReconcile =
+    forceReconcile ||
+    pendingRows.length > 0 ||
+    activeRows.length > 1 ||
+    inconsistentPlan ||
+    activeRows.some((row) => {
+      if (!row.lastStripePayloadAt) return true;
+      return Date.now() - new Date(row.lastStripePayloadAt).getTime() > staleMs;
+    });
+
+  if (needsReconcile) {
+    try {
+      await reconcileUserSubscriptionsFromStripe(uid);
+    } catch (err) {
+      console.warn('[billing-service] reconcileUserSubscriptionsFromStripe failed:', err?.message || err);
+    }
+  }
+
+  const freshRows = await BillingSubscription.find({ userId: uid }).lean();
+  const sub =
+    pickBestSubscriptionRow(freshRows.filter((row) => row.hasProAccess)) ||
+    pickBestSubscriptionRow(freshRows.filter((row) => String(row.status) === 'PENDING')) ||
+    pickBestSubscriptionRow(freshRows);
 
   const customer = await BillingCustomer.findOne({ userId: uid }).lean();
 
@@ -218,6 +359,9 @@ async function getSubscriptionSnapshotForUser(userId) {
 module.exports = {
   persistSubscriptionFromStripe,
   getSubscriptionSnapshotForUser,
+  reconcileUserSubscriptionsFromStripe,
   mapStatus,
   resolvePlanFromSubscription,
+  resolvePersistedAccess,
+  inferPaymentConfirmedFromStripe,
 };
