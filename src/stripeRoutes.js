@@ -11,7 +11,7 @@ const {
 } = require('./stripeService');
 const { isBillingDbConfigured } = require('./db');
 const WebhookEvent = require('./models/WebhookEvent');
-const { persistSubscriptionFromStripe, getSubscriptionSnapshotForUser } = require('./subscriptionPersistence');
+const { persistSubscriptionFromStripe, getSubscriptionSnapshotForUser, claimInvoiceEmail, listRenewalReminderCandidates, markRenewalReminderSent } = require('./subscriptionPersistence');
 const transportRoutes = require('./transportRoutes');
 
 const router = express.Router();
@@ -36,6 +36,16 @@ async function persistInvoiceOutcome(invoice, extras) {
   const userId = invoice.metadata?.userId || subscription.metadata?.userId;
   await persistSubscriptionFromStripe(subscription, userId, extras);
   await syncSubscriptionToSpring(subscription, userId);
+
+  const invoiceId = invoice?.id ? String(invoice.id) : null;
+  if (invoiceId) {
+    const { notifyMainApiSubscriptionInvoice } = require('./subscriptionInvoiceNotify');
+    if (extras.paymentConfirmed) {
+      await notifyMainApiSubscriptionInvoice({ invoiceId, outcome: 'paid' });
+    } else if (extras.paymentFailed) {
+      await notifyMainApiSubscriptionInvoice({ invoiceId, outcome: 'failed' });
+    }
+  }
 }
 
 function requireInternalKey(req, res) {
@@ -316,6 +326,63 @@ router.post('/internal/invoice-outcome', bodyParser.json(), async (req, res) => 
   } catch (err) {
     console.error('Error applying invoice outcome', err);
     res.status(500).json({ error: 'Failed to apply invoice outcome' });
+  }
+});
+
+router.post('/internal/claim-invoice-email', bodyParser.json(), async (req, res) => {
+  try {
+    if (!requireInternalKey(req, res)) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    const subscriptionId = String(req.body?.subscriptionId || '').trim();
+    const invoiceId = String(req.body?.invoiceId || '').trim();
+    const kind = String(req.body?.kind || 'paid').trim().toLowerCase();
+    if (!subscriptionId || !invoiceId) {
+      return res.status(400).json({ error: 'subscriptionId and invoiceId are required' });
+    }
+    if (kind !== 'paid' && kind !== 'failed') {
+      return res.status(400).json({ error: 'kind must be paid or failed' });
+    }
+    const result = await claimInvoiceEmail(subscriptionId, invoiceId, kind);
+    return res.json(result);
+  } catch (err) {
+    console.error('Error claiming invoice email', err);
+    res.status(500).json({ error: 'Failed to claim invoice email' });
+  }
+});
+
+router.get('/internal/renewal-reminder-candidates', async (req, res) => {
+  try {
+    if (!requireInternalKey(req, res)) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    if (!isBillingDbConfigured()) {
+      return res.status(503).json({ error: 'Billing database not configured' });
+    }
+    const days = req.query.days;
+    const candidates = await listRenewalReminderCandidates(days);
+    return res.json({ candidates });
+  } catch (err) {
+    console.error('Error listing renewal reminder candidates', err);
+    res.status(500).json({ error: 'Failed to list renewal reminder candidates' });
+  }
+});
+
+router.post('/internal/mark-renewal-reminder', bodyParser.json(), async (req, res) => {
+  try {
+    if (!requireInternalKey(req, res)) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    const subscriptionId = String(req.body?.subscriptionId || '').trim();
+    const periodEnd = req.body?.periodEnd;
+    if (!subscriptionId || !periodEnd) {
+      return res.status(400).json({ error: 'subscriptionId and periodEnd are required' });
+    }
+    const result = await markRenewalReminderSent(subscriptionId, periodEnd);
+    return res.json(result);
+  } catch (err) {
+    console.error('Error marking renewal reminder', err);
+    res.status(500).json({ error: 'Failed to mark renewal reminder' });
   }
 });
 

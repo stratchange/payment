@@ -228,6 +228,12 @@ async function finalizeSubscriptionFlow(refreshed, userId, expectedPeriod = null
     console.warn('[transport] reconcile after subscribe:', err?.message || err);
   });
   await syncSubscriptionToSpring(expanded, String(userId));
+
+  if (settled && inv?.id) {
+    const { notifyMainApiSubscriptionInvoice } = require('./subscriptionInvoiceNotify');
+    await notifyMainApiSubscriptionInvoice({ invoiceId: String(inv.id), outcome: 'paid' });
+  }
+
   return { ok: true, pending: !settled, subscriptionId: subId || undefined };
 }
 

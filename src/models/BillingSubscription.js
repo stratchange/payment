@@ -23,6 +23,13 @@ const billingSubscriptionSchema = new mongoose.Schema(
     currentPeriodEnd: { type: Date, default: null },
     cancelAtPeriodEnd: { type: Boolean, default: false },
 
+    /** Dedup subscription invoice.paid emails (main API webhook). */
+    lastPaidInvoiceId: { type: String, trim: true, default: null },
+    /** Dedup subscription payment_failed emails. */
+    lastFailedInvoiceId: { type: String, trim: true, default: null },
+    renewalReminderSentAt: { type: Date, default: null },
+    renewalReminderForPeriodEnd: { type: Date, default: null },
+
     lastStripePayloadAt: { type: Date, default: null },
   },
   { timestamps: true }

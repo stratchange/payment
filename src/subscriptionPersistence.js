@@ -356,6 +356,80 @@ async function getSubscriptionSnapshotForUser(userId, { forceReconcile = false }
   };
 }
 
+async function claimInvoiceEmail(stripeSubscriptionId, invoiceId, kind) {
+  if (!isBillingDbConfigured()) return { claimed: true, reason: 'no_billing_db' };
+  const subId = String(stripeSubscriptionId || '').trim();
+  const invId = String(invoiceId || '').trim();
+  if (!subId || !invId) return { claimed: false, reason: 'missing_ids' };
+
+  const field = kind === 'failed' ? 'lastFailedInvoiceId' : 'lastPaidInvoiceId';
+  const result = await BillingSubscription.findOneAndUpdate(
+    { stripeSubscriptionId: subId, [field]: { $ne: invId } },
+    { $set: { [field]: invId } },
+    { new: true }
+  );
+  if (result) return { claimed: true };
+
+  const existing = await BillingSubscription.findOne({ stripeSubscriptionId: subId }).lean();
+  if (!existing) return { claimed: true, reason: 'no_subscription_row' };
+  if (existing[field] === invId) return { claimed: false, reason: 'already_sent' };
+  return { claimed: false, reason: 'claim_conflict' };
+}
+
+async function listRenewalReminderCandidates(days) {
+  if (!isBillingDbConfigured()) return [];
+
+  const offsetDays = Number.parseInt(String(days ?? '3'), 10);
+  if (!Number.isFinite(offsetDays) || offsetDays <= 0) return [];
+
+  const now = new Date();
+  const from = new Date(now);
+  from.setUTCDate(from.getUTCDate() + offsetDays);
+  from.setUTCHours(0, 0, 0, 0);
+  const to = new Date(from);
+  to.setUTCHours(23, 59, 59, 999);
+
+  const rows = await BillingSubscription.find({
+    hasProAccess: true,
+    currentPeriodEnd: { $gte: from, $lte: to },
+    stripeCustomerId: { $exists: true, $nin: [null, ''] },
+  }).lean();
+
+  return rows
+    .filter((row) => {
+      if (!row.currentPeriodEnd) return false;
+      const endMs = new Date(row.currentPeriodEnd).getTime();
+      const sentForMs = row.renewalReminderForPeriodEnd
+        ? new Date(row.renewalReminderForPeriodEnd).getTime()
+        : null;
+      return sentForMs !== endMs;
+    })
+    .map((row) => ({
+      userId: row.userId,
+      stripeSubscriptionId: row.stripeSubscriptionId,
+      stripeCustomerId: row.stripeCustomerId,
+      currentPeriodEnd: row.currentPeriodEnd,
+      plan: row.plan,
+    }));
+}
+
+async function markRenewalReminderSent(stripeSubscriptionId, periodEnd) {
+  if (!isBillingDbConfigured()) return { ok: false };
+  const subId = String(stripeSubscriptionId || '').trim();
+  if (!subId || !periodEnd) return { ok: false };
+
+  await BillingSubscription.updateOne(
+    { stripeSubscriptionId: subId },
+    {
+      $set: {
+        renewalReminderSentAt: new Date(),
+        renewalReminderForPeriodEnd: new Date(periodEnd),
+      },
+    }
+  );
+  return { ok: true };
+}
+
 module.exports = {
   persistSubscriptionFromStripe,
   getSubscriptionSnapshotForUser,
@@ -364,4 +438,7 @@ module.exports = {
   resolvePlanFromSubscription,
   resolvePersistedAccess,
   inferPaymentConfirmedFromStripe,
+  claimInvoiceEmail,
+  listRenewalReminderCandidates,
+  markRenewalReminderSent,
 };
