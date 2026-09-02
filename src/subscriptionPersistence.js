@@ -350,6 +350,7 @@ async function getSubscriptionSnapshotForUser(userId, { forceReconcile = false }
           hasProAccess: sub.hasProAccess,
           currentPeriodEnd: sub.currentPeriodEnd,
           cancelAtPeriodEnd: sub.cancelAtPeriodEnd,
+          createdAt: sub.createdAt,
           updatedAt: sub.updatedAt,
         }
       : null,
