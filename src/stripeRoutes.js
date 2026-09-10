@@ -11,7 +11,7 @@ const {
 } = require('./stripeService');
 const { isBillingDbConfigured } = require('./db');
 const WebhookEvent = require('./models/WebhookEvent');
-const { persistSubscriptionFromStripe, getSubscriptionSnapshotForUser, claimInvoiceEmail, listRenewalReminderCandidates, markRenewalReminderSent } = require('./subscriptionPersistence');
+const { persistSubscriptionFromStripe, getSubscriptionSnapshotForUser, getSubscriptionSnapshotsForUsers, claimInvoiceEmail, listRenewalReminderCandidates, markRenewalReminderSent } = require('./subscriptionPersistence');
 const transportRoutes = require('./transportRoutes');
 
 const router = express.Router();
@@ -300,6 +300,35 @@ router.get('/internal/subscription', async (req, res) => {
   } catch (err) {
     console.error('Error reading internal subscription', err);
     res.status(500).json({ error: 'Failed to read subscription' });
+  }
+});
+
+router.get('/internal/subscriptions', async (req, res) => {
+  try {
+    if (!requireInternalKey(req, res)) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    if (!isBillingDbConfigured()) {
+      return res.status(503).json({ error: 'Billing database not configured' });
+    }
+    const raw = req.query.userIds;
+    const userIds = Array.isArray(raw)
+      ? raw
+      : String(raw || '')
+          .split(',')
+          .map((id) => id.trim())
+          .filter(Boolean);
+    if (!userIds.length) {
+      return res.status(400).json({ error: 'userIds is required' });
+    }
+    if (userIds.length > 100) {
+      return res.status(400).json({ error: 'userIds limit is 100' });
+    }
+    const snapshots = await getSubscriptionSnapshotsForUsers(userIds);
+    return res.json({ snapshots });
+  } catch (err) {
+    console.error('Error reading internal subscriptions', err);
+    res.status(500).json({ error: 'Failed to read subscriptions' });
   }
 });
 

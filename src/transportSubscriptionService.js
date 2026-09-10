@@ -366,6 +366,21 @@ exports.transportSubscribe = async ({ userId, email, fullName, billingPeriod, pa
         (wantsYearly && currentInterval === 'month') || (wantsMonthly && currentInterval === 'year');
 
       if (currentPrice === priceId && !intervalMismatch) {
+        if (existing.cancel_at_period_end) {
+          await stripe.subscriptions.update(existingSubId, {
+            cancel_at_period_end: false,
+            default_payment_method: pmId,
+            metadata: {
+              ...(existing.metadata || {}),
+              userId: String(userId),
+              billingPeriod: period,
+            },
+          });
+          const expanded = await stripe.subscriptions.retrieve(existingSubId, {
+            expand: ['latest_invoice.payment_intent', 'items.data.price'],
+          });
+          return finalizeSubscriptionFlow(expanded, userId, period);
+        }
         throw new HttpError(400, 'Vous êtes déjà abonné à cette période.', 'ALREADY_SUBSCRIBED');
       }
 
@@ -465,7 +480,19 @@ exports.transportPortal = async ({ userId }) => {
   return { url: session.url };
 };
 
-exports.transportCancel = async ({ userId }) => {
+function isTruthyFlag(value) {
+  return value === true || value === 'true' || value === 1 || value === '1';
+}
+
+function subscriptionPeriodEndIso(subscription) {
+  const epoch = subscription?.current_period_end || subscription?.items?.data?.[0]?.current_period_end;
+  if (epoch == null || epoch === '') return null;
+  const n = Number(epoch);
+  if (Number.isNaN(n)) return null;
+  return new Date(n * 1000).toISOString();
+}
+
+exports.transportCancel = async ({ userId, immediate }) => {
   if (!userId) throw new HttpError(400, 'userId est requis.', 'VALIDATION_ERROR');
   const subId = await findStripeSubscriptionIdForUser(userId);
 
@@ -473,11 +500,26 @@ exports.transportCancel = async ({ userId }) => {
     return { cancelled: false, reason: 'NO_SUBSCRIPTION_ID' };
   }
 
+  const cancelNow = isTruthyFlag(immediate);
+
   try {
-    if (typeof stripe.subscriptions.cancel === 'function') {
-      await stripe.subscriptions.cancel(subId, { prorate: false, invoice_now: false });
+    if (cancelNow) {
+      await cancelStripeSubscriptionImmediately(subId);
     } else {
-      await stripe.subscriptions.del(subId, { prorate: false });
+      const existing = await stripe.subscriptions.retrieve(subId);
+      if (['canceled', 'unpaid', 'incomplete_expired'].includes(String(existing.status || ''))) {
+        await persistSubscriptionFromStripe(existing, String(userId)).catch(() => {});
+        await syncSubscriptionToSpring(existing, String(userId));
+        return {
+          cancelled: true,
+          cancelAtPeriodEnd: Boolean(existing.cancel_at_period_end),
+          currentPeriodEnd: subscriptionPeriodEndIso(existing),
+          subscriptionId: subId,
+        };
+      }
+      if (!existing.cancel_at_period_end) {
+        await stripe.subscriptions.update(subId, { cancel_at_period_end: true });
+      }
     }
   } catch (err) {
     console.error('[transport] cancel subscription:', err?.message || err);
@@ -486,20 +528,27 @@ exports.transportCancel = async ({ userId }) => {
 
   let refreshed;
   try {
-    refreshed = await stripe.subscriptions.retrieve(subId);
+    refreshed = await stripe.subscriptions.retrieve(subId, {
+      expand: ['items.data.price'],
+    });
   } catch {
     refreshed = {
-             id: subId,
-             status: 'canceled',
-             metadata: { userId: String(userId) },
-             items: { data: [] },
-             customer: (await BillingCustomer.findOne({ userId: String(userId) }))?.stripeCustomerId,
-           };
+      id: subId,
+      status: 'canceled',
+      metadata: { userId: String(userId) },
+      items: { data: [] },
+      customer: (await BillingCustomer.findOne({ userId: String(userId) }))?.stripeCustomerId,
+    };
   }
 
   await persistSubscriptionFromStripe(refreshed, String(userId)).catch(() => {});
   await syncSubscriptionToSpring(refreshed, String(userId));
-  return { cancelled: true, subscriptionId: subId };
+  return {
+    cancelled: true,
+    cancelAtPeriodEnd: Boolean(refreshed.cancel_at_period_end),
+    currentPeriodEnd: subscriptionPeriodEndIso(refreshed),
+    subscriptionId: subId,
+  };
 };
 
 exports.transportSubscriptionCheckoutSession = async ({ userId, email, priceId, planId, planName }) => {

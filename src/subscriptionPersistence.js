@@ -331,6 +331,10 @@ async function getSubscriptionSnapshotForUser(userId, { forceReconcile = false }
 
   if (!sub && !customer) return null;
 
+  return formatSnapshot(customer, sub);
+}
+
+function formatSnapshot(customer, sub) {
   return {
     customer: customer
       ? {
@@ -355,6 +359,45 @@ async function getSubscriptionSnapshotForUser(userId, { forceReconcile = false }
         }
       : null,
   };
+}
+
+function pickSnapshotSub(rows) {
+  return (
+    pickBestSubscriptionRow(rows.filter((row) => row.hasProAccess)) ||
+    pickBestSubscriptionRow(rows.filter((row) => String(row.status) === 'PENDING')) ||
+    pickBestSubscriptionRow(rows)
+  );
+}
+
+async function getSubscriptionSnapshotsForUsers(userIds) {
+  if (!isBillingDbConfigured()) return {};
+  const ids = [...new Set((userIds || []).map((id) => String(id || '').trim()).filter(Boolean))];
+  if (!ids.length) return {};
+
+  const [subs, customers] = await Promise.all([
+    BillingSubscription.find({ userId: { $in: ids } }).lean(),
+    BillingCustomer.find({ userId: { $in: ids } }).lean(),
+  ]);
+
+  const subsByUser = new Map();
+  for (const row of subs || []) {
+    const uid = String(row.userId);
+    if (!subsByUser.has(uid)) subsByUser.set(uid, []);
+    subsByUser.get(uid).push(row);
+  }
+  const customersByUser = new Map((customers || []).map((row) => [String(row.userId), row]));
+
+  const out = {};
+  for (const uid of ids) {
+    const sub = pickSnapshotSub(subsByUser.get(uid) || []);
+    const customer = customersByUser.get(uid) || null;
+    if (!sub && !customer) {
+      out[uid] = null;
+      continue;
+    }
+    out[uid] = formatSnapshot(customer, sub);
+  }
+  return out;
 }
 
 async function claimInvoiceEmail(stripeSubscriptionId, invoiceId, kind) {
@@ -392,6 +435,7 @@ async function listRenewalReminderCandidates(days) {
 
   const rows = await BillingSubscription.find({
     hasProAccess: true,
+    cancelAtPeriodEnd: { $ne: true },
     currentPeriodEnd: { $gte: from, $lte: to },
     stripeCustomerId: { $exists: true, $nin: [null, ''] },
   }).lean();
@@ -434,6 +478,7 @@ async function markRenewalReminderSent(stripeSubscriptionId, periodEnd) {
 module.exports = {
   persistSubscriptionFromStripe,
   getSubscriptionSnapshotForUser,
+  getSubscriptionSnapshotsForUsers,
   reconcileUserSubscriptionsFromStripe,
   mapStatus,
   resolvePlanFromSubscription,
