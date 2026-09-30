@@ -7,7 +7,7 @@ const mongoose = require('mongoose');
 async function connectBillingDb() {
   const uri = (process.env.BILLING_MONGODB_URI || '').trim();
   if (!uri) {
-    console.warn('[billing-service] BILLING_MONGODB_URI not set; local subscription DB persistence is disabled.');
+    console.warn('[billing-service] BILLING_MONGODB_URI not set; booking persistence is disabled.');
     return false;
   }
   if (mongoose.connection.readyState === 1) {
@@ -25,13 +25,11 @@ async function connectBillingDb() {
  * Ensures billing collections exist and indexes match Mongoose schemas.
  */
 async function ensureBillingCollections() {
-  const BillingCustomer = require('./models/BillingCustomer');
-  const BillingSubscription = require('./models/BillingSubscription');
   const WebhookEvent = require('./models/WebhookEvent');
+  const bookingModels = require('./models/booking');
 
-  await BillingCustomer.syncIndexes();
-  await BillingSubscription.syncIndexes();
   await WebhookEvent.syncIndexes();
+  await Promise.all(Object.values(bookingModels).map((Model) => Model.syncIndexes()));
   console.log('[billing-service] Billing database schema ready (collections / indexes).');
 }
 

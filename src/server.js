@@ -3,6 +3,8 @@ const express = require('express');
 const cors = require('cors');
 const { connectBillingDb, isBillingDbConfigured } = require('./db');
 const billingRoutes = require('./stripeRoutes');
+const bookingRoutes = require('./bookingRoutes');
+const { startCashMonthJob } = require('./bookingService');
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -15,7 +17,8 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok' });
 });
 
-// All Stripe / billing endpoints under /billing
+// Booking commission, plus the Stripe webhook.
+app.use('/billing', bookingRoutes);
 app.use('/billing', billingRoutes);
 
 (async function start() {
@@ -29,5 +32,6 @@ app.use('/billing', billingRoutes);
   }
   app.listen(port, () => {
     console.log(`Billing service listening on port ${port}`);
+    startCashMonthJob();
   });
 })();
