@@ -751,8 +751,29 @@ async function putPreferences(userId, body) {
   return preferenceView(userId);
 }
 
-function connectReturnUrl() {
-  return (process.env.CONNECT_RETURN_URL || 'http://localhost:8080/transporter/settings').trim();
+function connectOriginAllowed(origin) {
+  if (origin === 'http://localhost:8080' || origin === 'http://127.0.0.1:8080') return true;
+  try {
+    const url = new URL(origin);
+    if (url.protocol !== 'https:') return false;
+    const host = url.hostname.toLowerCase();
+    return host === 'shippizy.com' || host.endsWith('.shippizy.com');
+  } catch {
+    return false;
+  }
+}
+
+function connectReturnUrl(requested) {
+  const fallback = (process.env.CONNECT_RETURN_URL || 'http://localhost:8080/transporter/settings').trim();
+  const raw = String(requested || '').trim();
+  if (!raw) return fallback;
+  try {
+    const url = new URL(raw);
+    if (!connectOriginAllowed(url.origin)) return fallback;
+    return `${url.origin}/transporter/settings`;
+  } catch {
+    return fallback;
+  }
 }
 
 function stripeAccountMissing(err) {
@@ -802,11 +823,12 @@ function withConnectLock(userId, task) {
   return run;
 }
 
-async function onboardingLink(stripe, accountId) {
+async function onboardingLink(stripe, accountId, requestedReturnUrl) {
+  const back = connectReturnUrl(requestedReturnUrl);
   const link = await stripe.accountLinks.create({
     account: accountId,
-    refresh_url: connectReturnUrl(),
-    return_url: connectReturnUrl(),
+    refresh_url: back,
+    return_url: back,
     type: 'account_onboarding',
   });
   return link.url;
@@ -830,7 +852,7 @@ async function rememberStripeAccount(row, account) {
   return row;
 }
 
-async function connectAccountUnlocked(id, mail) {
+async function connectAccountUnlocked(id, mail, returnUrl) {
   const stripe = stripeClient();
   let row = await ConnectedAccount.findOne({ userId: id });
   if (row?.stripeAccountId) {
@@ -838,7 +860,7 @@ async function connectAccountUnlocked(id, mail) {
       const account = await stripe.accounts.retrieve(row.stripeAccountId);
       await rememberStripeAccount(row, account);
       if (row.chargesEnabled && row.payoutsEnabled) return connectView(row, { reused: true });
-      const url = await onboardingLink(stripe, row.stripeAccountId);
+      const url = await onboardingLink(stripe, row.stripeAccountId, returnUrl);
       return connectView(row, { url, reused: true });
     } catch (err) {
       if (!stripeAccountMissing(err)) throw err;
@@ -860,13 +882,13 @@ async function connectAccountUnlocked(id, mail) {
       const existing = await stripe.accounts.retrieve(row.stripeAccountId);
       await rememberStripeAccount(row, existing);
       if (row.chargesEnabled && row.payoutsEnabled) return connectView(row, { reused: true });
-      const url = await onboardingLink(stripe, row.stripeAccountId);
+      const url = await onboardingLink(stripe, row.stripeAccountId, returnUrl);
       return connectView(row, { url, reused: true });
     }
   } else {
     await rememberStripeAccount(row, account);
   }
-  const url = await onboardingLink(stripe, row.stripeAccountId);
+  const url = await onboardingLink(stripe, row.stripeAccountId, returnUrl);
   return connectView(row, { url, reused: false });
 }
 
@@ -874,7 +896,7 @@ async function connectAccount(body) {
   const id = String(body?.userId || '').trim();
   const mail = String(body?.email || '').trim();
   if (!id || !mail) throw new HttpError(400, 'VALIDATION_ERROR', 'userId and email are required.');
-  return withConnectLock(id, () => connectAccountUnlocked(id, mail));
+  return withConnectLock(id, () => connectAccountUnlocked(id, mail, body?.returnUrl));
 }
 
 async function connectStatus(userId) {
